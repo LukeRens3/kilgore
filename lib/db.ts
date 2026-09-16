@@ -34,7 +34,7 @@ export function readConfig(): DbConfig | null {
   if (!DB_HOST || !DB_USER) return null;
   return {
     host: DB_HOST,
-    port: Number(DB_PORT ?? 3306),
+    port: 3306,
     user: DB_USER,
     password: DB_PASSWORD ?? "",
     database: DB_NAME || undefined,
