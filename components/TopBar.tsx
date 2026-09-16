@@ -1,13 +1,12 @@
 "use client";
 
 import type { Connection, Database } from "@/lib/types";
-import { DatabaseIcon, MoonIcon, ServerIcon, SunIcon } from "./Icons";
+import { DatabaseIcon, MoonIcon, ServerIcon, SignOutIcon, SunIcon } from "./Icons";
 
 export interface TopBarProps {
-  connections: Connection[];
-  activeConnection: Connection | null;
-  onSelectConnection: (id: string) => void;
-  onManageConnections: () => void;
+  /** The one live connection, or null while signing in. */
+  connection: Connection | null;
+  onSignOut: () => void;
   databases: Database[];
   activeDatabase: string | null;
   onSelectDatabase: (name: string) => void;
@@ -23,17 +22,15 @@ const STATUS_LABEL: Record<Connection["status"], string> = {
 };
 
 export default function TopBar({
-  connections,
-  activeConnection,
-  onSelectConnection,
-  onManageConnections,
+  connection,
+  onSignOut,
   databases,
   activeDatabase,
   onSelectDatabase,
   theme,
   onToggleTheme,
 }: TopBarProps) {
-  const status = activeConnection?.status ?? "disconnected";
+  const status = connection?.status ?? "disconnected";
 
   return (
     <header className="topbar">
@@ -46,24 +43,6 @@ export default function TopBar({
       </div>
 
       <div className="topbar-controls">
-        <label className="field">
-          <span className="field-label">Connection</span>
-          <div className="select-wrap">
-            <span className={`status-dot status-${status}`} aria-hidden="true" />
-            <select
-              value={activeConnection?.id ?? ""}
-              onChange={(event) => onSelectConnection(event.target.value)}
-              aria-label="Active connection"
-            >
-              {connections.map((connection) => (
-                <option key={connection.id} value={connection.id}>
-                  {connection.name}
-                </option>
-              ))}
-            </select>
-          </div>
-        </label>
-
         <label className="field">
           <span className="field-label">Database</span>
           <div className="select-wrap">
@@ -83,19 +62,15 @@ export default function TopBar({
             </select>
           </div>
         </label>
-
-        <button type="button" className="button button-ghost" onClick={onManageConnections}>
-          Manage
-        </button>
       </div>
 
       <div className="topbar-right">
-        <span className="connection-detail" title={activeConnection?.host}>
-          {activeConnection
-            ? `${activeConnection.username}@${activeConnection.host}:${activeConnection.port}`
-            : "No connection"}
-          {activeConnection?.serverVersion && (
-            <span className="connection-version">MySQL {activeConnection.serverVersion}</span>
+        <span className="connection-detail" title={connection?.host}>
+          {connection
+            ? `${connection.username}@${connection.host}:${connection.port}`
+            : "Not signed in"}
+          {connection?.serverVersion && (
+            <span className="connection-version">MySQL {connection.serverVersion}</span>
           )}
         </span>
         <span className={`status-pill status-${status}`}>{STATUS_LABEL[status]}</span>
@@ -107,6 +82,16 @@ export default function TopBar({
           aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
         >
           {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+        </button>
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onSignOut}
+          disabled={!connection}
+          title="Sign out"
+          aria-label="Sign out"
+        >
+          <SignOutIcon />
         </button>
       </div>
     </header>

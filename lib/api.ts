@@ -1,144 +1,104 @@
-import type { Connection, Database, QueryRun } from "./types";
-import {
-  MOCK_CONNECTIONS,
-} from "./mockData";
-import {
-  fetchDatabases as fetchMockDatabases,
-  runQuery as runMockQuery,
-} from "./mockEngine";
+import type { Database, QueryRun } from "./types";
 
 /**
  * The browser-side data layer.
  *
- * Talks to the API routes, which hold the credentials. When the server reports
- * that no database is configured, everything falls back to the mock engine so
- * the editor still works for anyone without VPC access.
+ * There is no service account behind these routes: the signed-in user's MySQL
+ * credentials travel in the body of every request and are held only in React
+ * state, so a refresh signs you out. Nothing is written to a cookie, to
+ * localStorage, or to any server-side session.
  */
 
-export type DataSource = "mysql" | "mock";
+export interface Credentials {
+  user: string;
+  password: string;
+  /** Optional schema the session opens with; the UI can switch freely after. */
+  database?: string;
+}
 
-export interface ServerInfo {
+/** Where the server is pointed. Fixed by deployment, same for every visitor. */
+export interface ServerConfig {
   host: string;
   port: number;
-  user: string;
-  /** Absent when the server could not be reached to ask. */
-  version?: string;
   ssl: boolean;
 }
 
+export interface ServerInfo extends ServerConfig {
+  user: string;
+  /** Absent when the server could not be reached to ask. */
+  version?: string;
+}
+
 export interface SchemaResult {
-  source: DataSource;
   databases: Database[];
   server?: ServerInfo;
-  /** Set when a real connection was configured but could not be reached. */
+  /** Set when the schema could not be read. */
   error?: string;
 }
 
-export interface PingResult {
-  configured: boolean;
-  reachable: boolean;
-  version?: string;
-  latencyMs?: number;
-  host?: string;
-  port?: number;
-  code?: string;
-  message?: string;
+/** Thrown when MySQL rejects the credentials, so callers can re-prompt. */
+export class AuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthError";
+  }
 }
 
-/** Remembered so the connection list and status bar agree with the schema. */
-let lastServer: ServerInfo | undefined;
-let lastError: string | undefined;
+async function postJson(path: string, body: unknown): Promise<any> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+
+  const payload = await response.json().catch(() => ({}));
+
+  if (response.status === 401) {
+    throw new AuthError(payload.message ?? payload.error ?? "Access denied.");
+  }
+  if (!response.ok) {
+    throw new Error(
+      payload.message ?? payload.error ?? payload.reason ?? `Request failed (${response.status})`
+    );
+  }
+  return payload;
+}
+
+// --- Server identity -------------------------------------------------------
+
+/** Reads which server the sign-in prompt will authenticate against. */
+export async function fetchServerConfig(): Promise<ServerConfig> {
+  const response = await fetch("/api/config", { cache: "no-store" });
+  const payload = await response.json().catch(() => ({}));
+  if (!payload.configured) {
+    throw new Error(payload.reason ?? "The server has no database configured.");
+  }
+  return { host: payload.host, port: payload.port, ssl: payload.ssl };
+}
+
+// --- Sign in ---------------------------------------------------------------
+
+/**
+ * Verifies credentials by opening a real MySQL connection as that user.
+ * Resolves with the server version; throws AuthError if MySQL says no.
+ */
+export async function signIn(credentials: Credentials): Promise<string> {
+  const payload = await postJson("/api/ping", credentials);
+  return payload.version ?? "unknown";
+}
 
 // --- Schema ----------------------------------------------------------------
 
-export async function fetchSchema(): Promise<SchemaResult> {
+export async function fetchSchema(credentials: Credentials): Promise<SchemaResult> {
   try {
-    const response = await fetch("/api/schema", { cache: "no-store" });
-    const payload = await response.json();
-
-    if (payload.configured === false) {
-      lastServer = undefined;
-      lastError = undefined;
-      return { source: "mock", databases: await fetchMockDatabases("mock") };
-    }
-
-    if (!response.ok || payload.error) {
-      lastServer = payload.server;
-      lastError = payload.error ?? `Schema request failed (${response.status})`;
-      return { source: "mysql", databases: [], server: payload.server, error: lastError };
-    }
-
-    lastServer = payload.server;
-    lastError = undefined;
-    return { source: "mysql", databases: payload.databases, server: payload.server };
+    const payload = await postJson("/api/schema", credentials);
+    return { databases: payload.databases ?? [], server: payload.server };
   } catch (error) {
-    // The route itself is unreachable - fall back rather than showing nothing.
-    lastError = error instanceof Error ? error.message : String(error);
+    if (error instanceof AuthError) throw error;
     return {
-      source: "mock",
-      databases: await fetchMockDatabases("mock"),
-      error: lastError,
-    };
-  }
-}
-
-/** Kept for callers that only need the tree. */
-export async function fetchDatabases(): Promise<Database[]> {
-  return (await fetchSchema()).databases;
-}
-
-// --- Connections -----------------------------------------------------------
-
-export async function listConnections(): Promise<Connection[]> {
-  const schema = await fetchSchema();
-
-  if (schema.source === "mock") {
-    return MOCK_CONNECTIONS.map((connection) => ({ ...connection }));
-  }
-
-  const server = schema.server;
-  return [
-    {
-      id: "env",
-      name: server ? server.host.split(".")[0] || server.host : "Configured server",
-      host: server?.host ?? "unknown",
-      port: server?.port ?? 3306,
-      username: server?.user ?? "",
-      database: schema.databases[0]?.name,
-      useSsl: server?.ssl ?? true,
-      status: schema.error ? "error" : "connected",
-      serverVersion: server?.version,
-    },
-  ];
-}
-
-export async function connect(connectionId: string): Promise<Connection> {
-  const connections = await listConnections();
-  const found = connections.find((c) => c.id === connectionId);
-  if (found) return found;
-  const fallback = MOCK_CONNECTIONS.find((c) => c.id === connectionId);
-  if (!fallback) throw new Error(`Unknown connection: ${connectionId}`);
-  return { ...fallback, status: "connected" };
-}
-
-export async function disconnect(connectionId: string): Promise<Connection> {
-  const connections = await listConnections();
-  const found =
-    connections.find((c) => c.id === connectionId) ??
-    MOCK_CONNECTIONS.find((c) => c.id === connectionId);
-  if (!found) throw new Error(`Unknown connection: ${connectionId}`);
-  return { ...found, status: "disconnected" };
-}
-
-export async function ping(): Promise<PingResult> {
-  try {
-    const response = await fetch("/api/ping", { cache: "no-store" });
-    return (await response.json()) as PingResult;
-  } catch (error) {
-    return {
-      configured: false,
-      reachable: false,
-      message: error instanceof Error ? error.message : String(error),
+      databases: [],
+      error: error instanceof Error ? error.message : String(error),
     };
   }
 }
@@ -146,58 +106,24 @@ export async function ping(): Promise<PingResult> {
 // --- Queries ---------------------------------------------------------------
 
 export interface RunQueryInput {
+  credentials: Credentials;
   connectionId: string;
   database: string | null;
   sql: string;
-  /** Only consulted by the mock engine. */
-  databases: Database[];
 }
 
 export async function runQuery(input: RunQueryInput): Promise<QueryRun> {
   try {
-    const response = await fetch("/api/query", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sql: input.sql,
-        database: input.database,
-        connectionId: input.connectionId,
-      }),
-    });
-
-    if (response.status === 503) {
-      // No database configured - the mock engine answers instead.
-      return runMockQuery(input);
-    }
-
-    const payload = await response.json();
-
-    if (!response.ok) {
-      // A transport or connection failure, not a SQL error: surface it as one
-      // failed statement so it shows up in the Messages tab like anything else.
-      return {
-        id: `run_err_${Date.now().toString(36)}`,
-        connectionId: input.connectionId,
-        database: input.database,
-        startedAt: Date.now(),
-        totalDurationMs: 0,
-        statements: [
-          {
-            sql: input.sql,
-            durationMs: 0,
-            outcome: {
-              kind: "error",
-              code: 2002,
-              sqlState: "HY000",
-              message: payload.error ?? `Query failed (${response.status})`,
-            },
-          },
-        ],
-      };
-    }
-
-    return payload as QueryRun;
+    return (await postJson("/api/query", {
+      ...input.credentials,
+      sql: input.sql,
+      database: input.database,
+      connectionId: input.connectionId,
+    })) as QueryRun;
   } catch (error) {
+    if (error instanceof AuthError) throw error;
+    // A transport or connection failure, not a SQL error: surface it as one
+    // failed statement so it shows up in the Messages tab like anything else.
     return {
       id: `run_err_${Date.now().toString(36)}`,
       connectionId: input.connectionId,
@@ -218,12 +144,4 @@ export async function runQuery(input: RunQueryInput): Promise<QueryRun> {
       ],
     };
   }
-}
-
-export function lastServerInfo(): ServerInfo | undefined {
-  return lastServer;
-}
-
-export function lastSchemaError(): string | undefined {
-  return lastError;
 }

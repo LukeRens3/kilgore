@@ -9,14 +9,17 @@
 
 export type ConnectionStatus = "connected" | "disconnected" | "connecting" | "error";
 
+/**
+ * The session's live connection, derived from the server's fixed address plus
+ * whoever signed in. Deliberately holds no password: credentials live only in
+ * the page's own state (see `lib/api.ts`).
+ */
 export interface Connection {
   id: string;
   name: string;
   host: string;
   port: number;
   username: string;
-  /** Never populated client-side once a real backend exists — kept for the form only. */
-  password?: string;
   database?: string;
   useSsl: boolean;
   status: ConnectionStatus;

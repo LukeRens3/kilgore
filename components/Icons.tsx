@@ -162,3 +162,18 @@ export const ServerIcon = (props: IconProps) => (
     <path d="M4.75 5h.01M4.75 11h.01" />
   </Icon>
 );
+
+export const LockIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <rect x="3.25" y="7" width="9.5" height="6.25" rx="1.25" />
+    <path d="M5.5 7V4.75a2.5 2.5 0 0 1 5 0V7" />
+  </Icon>
+);
+
+export const SignOutIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M6.25 2.75H3.5a.75.75 0 0 0-.75.75v9a.75.75 0 0 0 .75.75h2.75" />
+    <path d="M10 5.25 12.75 8 10 10.75" />
+    <path d="M12.75 8h-6.5" />
+  </Icon>
+);

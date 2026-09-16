@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { readConfig, runStatements } from "@/lib/db";
+import { isAuthError, readCredentials, readServerConfig, runStatements } from "@/lib/db";
 import { splitStatements } from "@/lib/sql";
 import type { QueryRun } from "@/lib/types";
 
@@ -12,24 +12,35 @@ interface QueryRequest {
   connectionId?: unknown;
 }
 
+/**
+ * Runs SQL as the signed-in user. There is no allow-list here on purpose: what
+ * a statement may do is decided by that user's MySQL grants, so restricting
+ * someone is a GRANT/REVOKE, not a change to this file.
+ */
 export async function POST(request: Request) {
-  const config = readConfig();
+  const config = readServerConfig();
   if (!config) {
     return NextResponse.json(
-      { configured: false, reason: "Database is not configured." },
+      { configured: false, reason: "DB_HOST is not set on the server." },
       { status: 503 }
     );
   }
 
-  let body: QueryRequest;
+  let body: QueryRequest | null;
   try {
-    body = await request.json();
+    body = (await request.json()) as QueryRequest;
   } catch {
     return NextResponse.json({ error: "Body must be JSON" }, { status: 400 });
   }
 
-  const sql = typeof body.sql === "string" ? body.sql : "";
-  const database = typeof body.database === "string" && body.database ? body.database : null;
+  const credentials = readCredentials(body);
+  if (!credentials) {
+    return NextResponse.json({ error: "Not signed in." }, { status: 401 });
+  }
+
+  const sql = typeof body?.sql === "string" ? body.sql : "";
+  const database =
+    typeof body?.database === "string" && body.database ? body.database : null;
   if (!sql.trim()) {
     return NextResponse.json({ error: "No SQL supplied" }, { status: 400 });
   }
@@ -41,10 +52,10 @@ export async function POST(request: Request) {
 
   const startedAt = Date.now();
   try {
-    const results = await runStatements(statements, database);
+    const results = await runStatements(credentials, statements, database);
     const run: QueryRun = {
       id: `run_${startedAt.toString(36)}`,
-      connectionId: typeof body.connectionId === "string" ? body.connectionId : "default",
+      connectionId: typeof body?.connectionId === "string" ? body.connectionId : "default",
       database,
       statements: results,
       startedAt,
@@ -59,7 +70,7 @@ export async function POST(request: Request) {
     const err = error as { message?: string; code?: string };
     return NextResponse.json(
       { error: err.message ?? String(error), code: err.code ?? "UNKNOWN" },
-      { status: 502 }
+      { status: isAuthError(error) ? 401 : 502 }
     );
   }
 }

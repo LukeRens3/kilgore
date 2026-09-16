@@ -3,11 +3,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Connection, Database, HistoryEntry, QueryRun, Table } from "@/lib/types";
 import {
-  connect,
+  AuthError,
   fetchSchema,
-  listConnections,
+  fetchServerConfig,
   runQuery,
-  type DataSource,
+  signIn,
+  type Credentials,
+  type ServerConfig,
 } from "@/lib/api";
 import { formatDuration, formatSql, quoteIdentifier } from "@/lib/format";
 import TopBar from "@/components/TopBar";
@@ -15,7 +17,7 @@ import SchemaSidebar from "@/components/SchemaSidebar";
 import QueryTabs from "@/components/QueryTabs";
 import SqlEditor, { type SqlEditorHandle } from "@/components/SqlEditor";
 import ResultsPanel from "@/components/ResultsPanel";
-import ConnectionDialog from "@/components/ConnectionDialog";
+import LoginDialog from "@/components/LoginDialog";
 import Splitter from "@/components/Splitter";
 
 interface QueryTab {
@@ -28,17 +30,7 @@ interface QueryTab {
 const STARTER_SQL = `-- Kilgore SQL editor
 -- Ctrl+Enter runs the query (or just the selection).
 
-SELECT
-  o.order_number,
-  o.status,
-  o.total,
-  c.email,
-  o.placed_at
-FROM shop.orders o
-JOIN shop.customers c ON c.id = o.customer_id
-WHERE o.status = 'paid'
-ORDER BY o.placed_at DESC
-LIMIT 50;`;
+SHOW DATABASES;`;
 
 const THEME_KEY = "kilgore.theme";
 let tabSequence = 1;
@@ -51,15 +43,18 @@ function newTab(sql = ""): QueryTab {
 export default function Page() {
   const [theme, setTheme] = useState<"dark" | "light">("dark");
 
-  const [connections, setConnections] = useState<Connection[]>([]);
-  const [activeConnectionId, setActiveConnectionId] = useState<string | null>(null);
-  const [dialogOpen, setDialogOpen] = useState(false);
+  // Credentials live here and nowhere else: no cookie, no storage, no server
+  // session. Closing or reloading the tab signs you out.
+  const [credentials, setCredentials] = useState<Credentials | null>(null);
+  const [server, setServer] = useState<ServerConfig | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [connection, setConnection] = useState<Connection | null>(null);
 
   const [databases, setDatabases] = useState<Database[]>([]);
-  const [schemaLoading, setSchemaLoading] = useState(true);
+  const [schemaLoading, setSchemaLoading] = useState(false);
   const [activeDatabase, setActiveDatabase] = useState<string | null>(null);
-  const [dataSource, setDataSource] = useState<DataSource>("mock");
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [signedOutReason, setSignedOutReason] = useState<string | null>(null);
 
   const [tabs, setTabs] = useState<QueryTab[]>([
     { id: "tab_1", title: "Query 1", sql: STARTER_SQL, dirty: false },
@@ -79,8 +74,6 @@ export default function Page() {
   const runToken = useRef(0);
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0];
-  const activeConnection =
-    connections.find((connection) => connection.id === activeConnectionId) ?? null;
   const running = Boolean(runningTabs[activeTab.id]);
   const currentRun = runs[activeTab.id] ?? null;
 
@@ -96,45 +89,101 @@ export default function Page() {
     window.localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
-  // --- Bootstrap connections and schema -----------------------------------
+  // --- Which server are we pointed at? -------------------------------------
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const loaded = await listConnections();
-      if (cancelled) return;
-      setConnections(loaded);
-      const first = loaded.find((c) => c.status === "connected") ?? loaded[0] ?? null;
-      setActiveConnectionId(first?.id ?? null);
-      setActiveDatabase(first?.database ?? null);
+      try {
+        const config = await fetchServerConfig();
+        if (!cancelled) setServer(config);
+      } catch (error) {
+        if (!cancelled) {
+          setConfigError(error instanceof Error ? error.message : String(error));
+        }
+      }
     })();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  const loadSchema = useCallback(async () => {
-    setSchemaLoading(true);
-    try {
-      const result = await fetchSchema();
-      setDatabases(result.databases);
-      setDataSource(result.source);
-      setSchemaError(result.error ?? null);
-      // Land on something real if the connection did not name a database.
-      setActiveDatabase((prev) =>
-        prev && result.databases.some((d) => d.name === prev)
-          ? prev
-          : (result.databases[0]?.name ?? null)
-      );
-    } finally {
-      setSchemaLoading(false);
-    }
+  // --- Session -------------------------------------------------------------
+
+  /** Drops every trace of the session from memory. */
+  const signOut = useCallback((reason: string | null = null) => {
+    setCredentials(null);
+    setConnection(null);
+    setDatabases([]);
+    setActiveDatabase(null);
+    setSchemaError(null);
+    setSignedOutReason(reason);
+    // Results and history came out of the database; they go with the session.
+    setRuns({});
+    setHistory([]);
+    setRunningTabs({});
   }, []);
 
-  useEffect(() => {
-    if (!activeConnectionId) return;
-    void loadSchema();
-  }, [activeConnectionId, loadSchema]);
+  const loadSchema = useCallback(
+    async (active: Credentials) => {
+      setSchemaLoading(true);
+      try {
+        const result = await fetchSchema(active);
+        setDatabases(result.databases);
+        setSchemaError(result.error ?? null);
+        setConnection((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: result.error ? "error" : "connected",
+                serverVersion: result.server?.version ?? prev.serverVersion,
+              }
+            : prev
+        );
+        // Land on something real if sign-in did not name a database.
+        setActiveDatabase((prev) =>
+          prev && result.databases.some((d) => d.name === prev)
+            ? prev
+            : (result.databases[0]?.name ?? null)
+        );
+      } catch (error) {
+        if (error instanceof AuthError) {
+          signOut(error.message);
+          return;
+        }
+        setSchemaError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setSchemaLoading(false);
+      }
+    },
+    [signOut]
+  );
+
+  const handleSignIn = useCallback(
+    async (next: Credentials) => {
+      if (!server) throw new Error("The server address is not known yet.");
+
+      // Throws on bad credentials; LoginDialog renders the message.
+      const version = await signIn(next);
+
+      setCredentials(next);
+      setSignedOutReason(null);
+      setConnection({
+        id: "session",
+        name: server.host.split(".")[0] || server.host,
+        host: server.host,
+        port: server.port,
+        username: next.user,
+        database: next.database,
+        useSsl: server.ssl,
+        status: "connected",
+        serverVersion: version,
+      });
+      setActiveDatabase(next.database ?? null);
+      await loadSchema(next);
+    },
+    [server, loadSchema]
+  );
 
   // --- Actions -------------------------------------------------------------
 
@@ -150,7 +199,7 @@ export default function Page() {
   const handleRun = useCallback(
     async (overrideSql?: string) => {
       const tab = tabs.find((t) => t.id === activeTabId);
-      if (!tab || !activeConnectionId) return;
+      if (!tab || !credentials) return;
       const sql = (overrideSql ?? (selection.trim() ? selection : tab.sql)).trim();
       if (!sql) return;
 
@@ -158,10 +207,10 @@ export default function Page() {
       setRunningTabs((prev) => ({ ...prev, [tab.id]: true }));
       try {
         const result = await runQuery({
-          connectionId: activeConnectionId,
+          credentials,
+          connectionId: "session",
           database: activeDatabase,
           sql,
-          databases,
         });
         if (token !== runToken.current) return;
 
@@ -181,11 +230,14 @@ export default function Page() {
             ...prev,
           ].slice(0, 100)
         );
+      } catch (error) {
+        // The session died underneath us - MySQL revoked or dropped the user.
+        if (error instanceof AuthError) signOut(error.message);
       } finally {
         setRunningTabs((prev) => ({ ...prev, [tab.id]: false }));
       }
     },
-    [tabs, activeTabId, activeConnectionId, activeDatabase, databases, selection]
+    [tabs, activeTabId, credentials, activeDatabase, selection, signOut]
   );
 
   function cancelRun() {
@@ -262,18 +314,8 @@ export default function Page() {
   return (
     <div className="app">
       <TopBar
-        connections={connections}
-        activeConnection={activeConnection}
-        onSelectConnection={(id) => {
-          setActiveConnectionId(id);
-          const next = connections.find((c) => c.id === id);
-          setActiveDatabase(next?.database ?? null);
-          void (async () => {
-            const updated = await connect(id);
-            setConnections((prev) => prev.map((c) => (c.id === id ? updated : c)));
-          })();
-        }}
-        onManageConnections={() => setDialogOpen(true)}
+        connection={connection}
+        onSignOut={() => signOut()}
         databases={databases}
         activeDatabase={activeDatabase}
         onSelectDatabase={setActiveDatabase}
@@ -290,7 +332,9 @@ export default function Page() {
           onPreviewTable={(database, table) => openTable(database, table, "rows")}
           onDescribeTable={(database, table) => openTable(database, table, "describe")}
           onInsertText={(text) => editorRef.current?.insertText(text)}
-          onRefresh={() => void loadSchema()}
+          onRefresh={() => {
+            if (credentials) void loadSchema(credentials);
+          }}
         />
 
         <Splitter
@@ -322,7 +366,7 @@ export default function Page() {
             onFormat={formatActiveSql}
             running={running}
             hasSelection={selection.trim().length > 0}
-            canRun={Boolean(activeConnection) && activeTab.sql.trim().length > 0}
+            canRun={Boolean(credentials) && activeTab.sql.trim().length > 0}
           />
 
           <div className="editor-pane" style={{ height: editorHeight }}>
@@ -361,7 +405,7 @@ export default function Page() {
       </div>
 
       <footer className="statusbar">
-        <span>{activeConnection ? activeConnection.name : "No connection"}</span>
+        <span>{connection ? connection.name : "Not signed in"}</span>
         <span className="statusbar-sep" />
         <span>{activeDatabase ?? "no database selected"}</span>
         <span className="statusbar-sep" />
@@ -372,32 +416,17 @@ export default function Page() {
             {schemaError}
           </span>
         )}
-        <span className={`source-pill source-${dataSource}`}>
-          {dataSource === "mysql" ? "Live MySQL" : "Mock data"}
-        </span>
+        {connection && <span className="source-pill source-mysql">Live MySQL</span>}
       </footer>
 
-      <ConnectionDialog
-        open={dialogOpen}
-        connections={connections}
-        activeConnectionId={activeConnectionId}
-        onClose={() => setDialogOpen(false)}
-        onConnect={(id) => {
-          setActiveConnectionId(id);
-          void (async () => {
-            const updated = await connect(id);
-            setConnections((prev) => prev.map((c) => (c.id === id ? updated : c)));
-          })();
-        }}
-        onSave={(connection) => {
-          setConnections((prev) => {
-            const exists = prev.some((c) => c.id === connection.id);
-            return exists
-              ? prev.map((c) => (c.id === connection.id ? connection : c))
-              : [...prev, connection];
-          });
-        }}
-      />
+      {!credentials && (
+        <LoginDialog
+          server={server}
+          configError={configError}
+          notice={signedOutReason}
+          onSignIn={handleSignIn}
+        />
+      )}
     </div>
   );
 }

@@ -13,67 +13,152 @@ import type {
 import { SYSTEM_SCHEMAS, statementVerb } from "./sql";
 
 /**
- * Server-side MySQL access. Only API routes may import this module - it holds
- * the credentials and the connection pool.
+ * Server-side MySQL access.
+ *
+ * The server owns the *address* of the database (host, port, TLS) and nothing
+ * else: there is no service account. Every request carries the credentials of
+ * the MySQL user driving it, so permissions are enforced by MySQL's own grant
+ * tables rather than by application code.
+ *
+ * Credentials are never cached, pooled or written to disk. Each request opens a
+ * short-lived connection and closes it again, which costs a handshake per call
+ * but keeps passwords out of any server-side structure that outlives the
+ * request.
  */
 
 /** Most rows we will ship to the browser for a single statement. */
 export const ROW_LIMIT = 500;
 
-export interface DbConfig {
+/** Where the database lives. Fixed by deployment, identical for every visitor. */
+export interface ServerConfig {
   host: string;
   port: number;
-  user: string;
-  password: string;
-  database?: string;
   ssl: boolean;
 }
 
-export function readConfig(): DbConfig | null {
-  const { DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME, DB_SSL } = process.env;
-  if (!DB_HOST || !DB_USER) return null;
+/** Who is connecting. Supplied per request, never retained. */
+export interface Credentials {
+  user: string;
+  password: string;
+  database?: string;
+}
+
+export function readServerConfig(): ServerConfig | null {
+  const { DB_HOST, DB_PORT, DB_SSL } = process.env;
+  if (!DB_HOST) return null;
   return {
     host: DB_HOST,
-    port: 3306,
-    user: DB_USER,
-    password: DB_PASSWORD ?? "",
-    database: DB_NAME || undefined,
+    port: Number(DB_PORT ?? 3306) || 3306,
     ssl: DB_SSL !== "false",
   };
 }
 
-let pool: mysql.Pool | null = null;
+/**
+ * RDS terminates TLS with an Amazon CA. Verification stays off unless DB_SSL_CA
+ * points at the bundle, so the app works without shipping the CA chain.
+ */
+function sslOption(config: ServerConfig) {
+  if (!config.ssl) return undefined;
+  return process.env.DB_SSL_CA
+    ? { ca: process.env.DB_SSL_CA, rejectUnauthorized: true }
+    : { rejectUnauthorized: false };
+}
 
-export function getPool(): mysql.Pool | null {
-  const config = readConfig();
-  if (!config) return null;
-  if (pool) return pool;
+/**
+ * Runs `work` against a connection authenticated as `credentials`, closing it
+ * whether or not the work succeeds.
+ */
+export async function withConnection<T>(
+  credentials: Credentials,
+  work: (connection: mysql.Connection) => Promise<T>
+): Promise<T> {
+  const config = readServerConfig();
+  if (!config) throw new Error("Server is not configured: DB_HOST is unset.");
 
-  pool = mysql.createPool({
+  const connection = await mysql.createConnection({
     host: config.host,
     port: config.port,
-    user: config.user,
-    password: config.password,
-    database: config.database,
-    waitForConnections: true,
-    connectionLimit: 5,
+    user: credentials.user,
+    password: credentials.password,
+    database: credentials.database,
     // Statements are split and run one at a time, so this stays off.
     multipleStatements: false,
-    enableKeepAlive: true,
     connectTimeout: 10_000,
-    // RDS terminates TLS with an Amazon CA. Verification is off by default so
-    // this works without shipping the RDS CA bundle; point DB_SSL_CA at the
-    // bundle to turn full verification back on.
-    ssl: config.ssl
-      ? process.env.DB_SSL_CA
-        ? { ca: process.env.DB_SSL_CA, rejectUnauthorized: true }
-        : { rejectUnauthorized: false }
-      : undefined,
+    ssl: sslOption(config),
     dateStrings: true,
     supportBigNumbers: true,
     bigNumberStrings: true,
   });
-  return pool;
+
+  try {
+    return await work(connection);
+  } finally {
+    // Closing must never mask the real error from `work`.
+    void connection.end().catch(() => undefined);
+  }
+}
+
+// --- Request parsing -------------------------------------------------------
+
+/** Pulls credentials out of a request body, or null if the user is missing. */
+export function readCredentials(body: unknown): Credentials | null {
+  if (!body || typeof body !== "object") return null;
+  const raw = body as Record<string, unknown>;
+
+  const user = typeof raw.user === "string" ? raw.user.trim() : "";
+  if (!user) return null;
+
+  const database =
+    typeof raw.database === "string" && raw.database.trim() ? raw.database.trim() : undefined;
+
+  return {
+    user,
+    password: typeof raw.password === "string" ? raw.password : "",
+    database,
+  };
+}
+
+interface MysqlError extends Error {
+  errno?: number;
+  sqlState?: string;
+  code?: string;
+}
+
+/**
+ * MySQL rejecting the *identity* is a 401, not a gateway failure - the UI
+ * reopens the sign-in prompt rather than reporting the server as unreachable.
+ *
+ * ER_DBACCESS_DENIED_ERROR is deliberately absent: it means the user
+ * authenticated fine but has no rights on one schema. Treating that as a 401
+ * would sign someone out for clicking the wrong database in the sidebar, so it
+ * surfaces as an ordinary error instead. The sign-in route opts into it
+ * separately, where a bad default schema really should keep you on the form.
+ */
+export const DB_ACCESS_DENIED = "ER_DBACCESS_DENIED_ERROR";
+
+const AUTH_ERROR_CODES = new Set([
+  "ER_ACCESS_DENIED_ERROR",
+  "ER_ACCESS_DENIED_NO_PASSWORD_ERROR",
+  "ER_NOT_SUPPORTED_AUTH_MODE",
+  "ER_MUST_CHANGE_PASSWORD",
+  "ER_MUST_CHANGE_PASSWORD_LOGIN",
+  "ER_HOST_NOT_PRIVILEGED",
+  "ER_HOST_IS_BLOCKED",
+]);
+
+export function isAuthError(error: unknown): boolean {
+  const code = (error as MysqlError)?.code;
+  return typeof code === "string" && AUTH_ERROR_CODES.has(code);
+}
+
+export function toQueryError(error: unknown): StatementOutcome {
+  const err = error as MysqlError;
+  return {
+    kind: "error",
+    code: err.errno ?? 0,
+    sqlState: err.sqlState ?? "HY000",
+    message: err.message ?? String(error),
+  };
 }
 
 // --- Field type mapping ----------------------------------------------------
@@ -119,22 +204,6 @@ function normalizeValue(value: unknown): SqlValue {
   return JSON.stringify(value);
 }
 
-interface MysqlError extends Error {
-  errno?: number;
-  sqlState?: string;
-  code?: string;
-}
-
-export function toQueryError(error: unknown): StatementOutcome {
-  const err = error as MysqlError;
-  return {
-    kind: "error",
-    code: err.errno ?? 0,
-    sqlState: err.sqlState ?? "HY000",
-    message: err.message ?? String(error),
-  };
-}
-
 // --- Statement execution ---------------------------------------------------
 
 interface StreamField {
@@ -149,7 +218,7 @@ interface StreamField {
  * server memory: rows past ROW_LIMIT are counted but not retained.
  */
 function executeOne(
-  connection: mysql.PoolConnection,
+  connection: mysql.Connection,
   sql: string
 ): Promise<StatementOutcome> {
   return new Promise((resolve) => {
@@ -219,16 +288,14 @@ function executeOne(
 }
 
 export async function runStatements(
+  credentials: Credentials,
   statements: string[],
   database: string | null
 ): Promise<{ outcome: StatementOutcome; sql: string; durationMs: number }[]> {
-  const activePool = getPool();
-  if (!activePool) throw new Error("Database is not configured");
-
-  const connection = await activePool.getConnection();
-  try {
+  return withConnection(credentials, async (connection) => {
     if (database) {
-      // Scope the session without rewriting the user's SQL.
+      // Scope the session without rewriting the user's SQL. A user without
+      // rights on this schema gets MySQL's own error, which is the point.
       await connection.query(`USE \`${database.replace(/`/g, "``")}\``);
     }
 
@@ -243,9 +310,7 @@ export async function runStatements(
       });
     }
     return results;
-  } finally {
-    connection.release();
-  }
+  });
 }
 
 // --- Schema introspection --------------------------------------------------
@@ -287,102 +352,116 @@ interface IndexRow {
 
 const EXCLUDED = SYSTEM_SCHEMAS.map(() => "?").join(", ");
 
-export async function introspect(): Promise<Database[]> {
-  const activePool = getPool();
-  if (!activePool) throw new Error("Database is not configured");
+/**
+ * Builds the schema tree. information_schema only returns rows the connected
+ * user can see, so the sidebar automatically reflects that user's grants.
+ */
+export async function introspect(credentials: Credentials): Promise<{
+  databases: Database[];
+  version: string;
+}> {
+  return withConnection(credentials, async (connection) => {
+    const [schemas] = await connection.query<mysql.RowDataPacket[]>(
+      `SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
+         FROM information_schema.SCHEMATA
+        WHERE SCHEMA_NAME NOT IN (${EXCLUDED})
+        ORDER BY SCHEMA_NAME`,
+      SYSTEM_SCHEMAS
+    );
 
-  const [schemas] = await activePool.query<mysql.RowDataPacket[]>(
-    `SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
-       FROM information_schema.SCHEMATA
-      WHERE SCHEMA_NAME NOT IN (${EXCLUDED})
-      ORDER BY SCHEMA_NAME`,
-    SYSTEM_SCHEMAS
-  );
+    const [tables] = await connection.query<mysql.RowDataPacket[]>(
+      `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS,
+              COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS SIZE_BYTES
+         FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA NOT IN (${EXCLUDED})
+        ORDER BY TABLE_SCHEMA, TABLE_NAME`,
+      SYSTEM_SCHEMAS
+    );
 
-  const [tables] = await activePool.query<mysql.RowDataPacket[]>(
-    `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_ROWS,
-            COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS SIZE_BYTES
-       FROM information_schema.TABLES
-      WHERE TABLE_SCHEMA NOT IN (${EXCLUDED})
-      ORDER BY TABLE_SCHEMA, TABLE_NAME`,
-    SYSTEM_SCHEMAS
-  );
+    const [columns] = await connection.query<mysql.RowDataPacket[]>(
+      `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE,
+              COLUMN_KEY, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT
+         FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA NOT IN (${EXCLUDED})
+        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`,
+      SYSTEM_SCHEMAS
+    );
 
-  const [columns] = await activePool.query<mysql.RowDataPacket[]>(
-    `SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE,
-            COLUMN_KEY, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT
-       FROM information_schema.COLUMNS
-      WHERE TABLE_SCHEMA NOT IN (${EXCLUDED})
-      ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`,
-    SYSTEM_SCHEMAS
-  );
+    const [indexes] = await connection.query<mysql.RowDataPacket[]>(
+      `SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE
+         FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA NOT IN (${EXCLUDED})
+        ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`,
+      SYSTEM_SCHEMAS
+    );
 
-  const [indexes] = await activePool.query<mysql.RowDataPacket[]>(
-    `SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE
-       FROM information_schema.STATISTICS
-      WHERE TABLE_SCHEMA NOT IN (${EXCLUDED})
-      ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`,
-    SYSTEM_SCHEMAS
-  );
+    const [versionRows] = await connection.query<mysql.RowDataPacket[]>(
+      "SELECT VERSION() AS v"
+    );
 
-  const columnsByTable = new Map<string, Column[]>();
-  for (const raw of columns as unknown as ColumnRow[]) {
-    const key = `${raw.TABLE_SCHEMA}.${raw.TABLE_NAME}`;
-    const list = columnsByTable.get(key) ?? [];
-    list.push({
-      name: raw.COLUMN_NAME,
-      dataType: raw.COLUMN_TYPE,
-      nullable: raw.IS_NULLABLE === "YES",
-      key: (raw.COLUMN_KEY || null) as ColumnKey,
-      defaultValue: raw.COLUMN_DEFAULT,
-      extra: raw.EXTRA ?? "",
-      comment: raw.COLUMN_COMMENT || undefined,
-    });
-    columnsByTable.set(key, list);
-  }
+    const columnsByTable = new Map<string, Column[]>();
+    for (const raw of columns as unknown as ColumnRow[]) {
+      const key = `${raw.TABLE_SCHEMA}.${raw.TABLE_NAME}`;
+      const list = columnsByTable.get(key) ?? [];
+      list.push({
+        name: raw.COLUMN_NAME,
+        dataType: raw.COLUMN_TYPE,
+        nullable: raw.IS_NULLABLE === "YES",
+        key: (raw.COLUMN_KEY || null) as ColumnKey,
+        defaultValue: raw.COLUMN_DEFAULT,
+        extra: raw.EXTRA ?? "",
+        comment: raw.COLUMN_COMMENT || undefined,
+      });
+      columnsByTable.set(key, list);
+    }
 
-  const indexesByTable = new Map<string, Map<string, TableIndex>>();
-  for (const raw of indexes as unknown as IndexRow[]) {
-    const key = `${raw.TABLE_SCHEMA}.${raw.TABLE_NAME}`;
-    const byName = indexesByTable.get(key) ?? new Map<string, TableIndex>();
-    const existing = byName.get(raw.INDEX_NAME) ?? {
-      name: raw.INDEX_NAME,
-      columns: [],
-      unique: Number(raw.NON_UNIQUE) === 0,
+    const indexesByTable = new Map<string, Map<string, TableIndex>>();
+    for (const raw of indexes as unknown as IndexRow[]) {
+      const key = `${raw.TABLE_SCHEMA}.${raw.TABLE_NAME}`;
+      const byName = indexesByTable.get(key) ?? new Map<string, TableIndex>();
+      const existing = byName.get(raw.INDEX_NAME) ?? {
+        name: raw.INDEX_NAME,
+        columns: [],
+        unique: Number(raw.NON_UNIQUE) === 0,
+      };
+      existing.columns.push(raw.COLUMN_NAME);
+      byName.set(raw.INDEX_NAME, existing);
+      indexesByTable.set(key, byName);
+    }
+
+    const tablesBySchema = new Map<string, Table[]>();
+    for (const raw of tables as unknown as TableRow[]) {
+      const key = `${raw.TABLE_SCHEMA}.${raw.TABLE_NAME}`;
+      const list = tablesBySchema.get(raw.TABLE_SCHEMA) ?? [];
+      list.push({
+        name: raw.TABLE_NAME,
+        kind: raw.TABLE_TYPE === "VIEW" ? "view" : "table",
+        engine: raw.ENGINE ?? "-",
+        // TABLE_ROWS is an estimate for InnoDB, which is what every client shows.
+        rowCount: Number(raw.TABLE_ROWS ?? 0),
+        sizeBytes: Number(raw.SIZE_BYTES ?? 0),
+        columns: columnsByTable.get(key) ?? [],
+        indexes: Array.from(indexesByTable.get(key)?.values() ?? []),
+      });
+      tablesBySchema.set(raw.TABLE_SCHEMA, list);
+    }
+
+    return {
+      databases: (schemas as unknown as SchemaRow[]).map((schema) => ({
+        name: schema.SCHEMA_NAME,
+        charset: schema.DEFAULT_CHARACTER_SET_NAME,
+        collation: schema.DEFAULT_COLLATION_NAME,
+        tables: tablesBySchema.get(schema.SCHEMA_NAME) ?? [],
+      })),
+      version: String(versionRows[0]?.v ?? "unknown"),
     };
-    existing.columns.push(raw.COLUMN_NAME);
-    byName.set(raw.INDEX_NAME, existing);
-    indexesByTable.set(key, byName);
-  }
-
-  const tablesBySchema = new Map<string, Table[]>();
-  for (const raw of tables as unknown as TableRow[]) {
-    const key = `${raw.TABLE_SCHEMA}.${raw.TABLE_NAME}`;
-    const list = tablesBySchema.get(raw.TABLE_SCHEMA) ?? [];
-    list.push({
-      name: raw.TABLE_NAME,
-      kind: raw.TABLE_TYPE === "VIEW" ? "view" : "table",
-      engine: raw.ENGINE ?? "-",
-      // TABLE_ROWS is an estimate for InnoDB, which is what every client shows.
-      rowCount: Number(raw.TABLE_ROWS ?? 0),
-      sizeBytes: Number(raw.SIZE_BYTES ?? 0),
-      columns: columnsByTable.get(key) ?? [],
-      indexes: Array.from(indexesByTable.get(key)?.values() ?? []),
-    });
-    tablesBySchema.set(raw.TABLE_SCHEMA, list);
-  }
-
-  return (schemas as unknown as SchemaRow[]).map((schema) => ({
-    name: schema.SCHEMA_NAME,
-    charset: schema.DEFAULT_CHARACTER_SET_NAME,
-    collation: schema.DEFAULT_COLLATION_NAME,
-    tables: tablesBySchema.get(schema.SCHEMA_NAME) ?? [],
-  }));
+  });
 }
 
-export async function serverVersion(): Promise<string> {
-  const activePool = getPool();
-  if (!activePool) throw new Error("Database is not configured");
-  const [rows] = await activePool.query<mysql.RowDataPacket[]>("SELECT VERSION() AS v");
-  return String(rows[0]?.v ?? "unknown");
+/** Verifies credentials by connecting as them. Used by the sign-in prompt. */
+export async function authenticate(credentials: Credentials): Promise<string> {
+  return withConnection(credentials, async (connection) => {
+    const [rows] = await connection.query<mysql.RowDataPacket[]>("SELECT VERSION() AS v");
+    return String(rows[0]?.v ?? "unknown");
+  });
 }
