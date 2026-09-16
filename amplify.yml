@@ -9,6 +9,10 @@ frontend:
   phases:
     build:
       commands:
+        # Amplify console environment variables reach the build container but not
+        # the Next.js SSR runtime. Baking DB_* into .env.production is the
+        # documented way to make them visible to process.env in the API routes.
+        - env | grep -E '^DB_' >> .env.production || echo "No DB_* vars set - app will serve mock data"
         - npm run build
   artifacts:
     baseDirectory: .next
